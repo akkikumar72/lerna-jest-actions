@@ -22,7 +22,7 @@ jobs:
       - name: Run test
         run: npm run test
       - name: Test printing your secret (Remove this step in production)
-        run: cat $HOME/secrets/my_secret.json
+        run:  echo 'The secrets.GITHUB_TOKEN is' ${secrets.GITHUB_TOKEN}
       - name: show report
         uses: mattallty/jest-github-action@v1
         with:
