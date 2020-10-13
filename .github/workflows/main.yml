@@ -7,55 +7,145 @@ on:
 
 # require public member
 # private member is treated as CONTRIBUTOR
-jobs:
-  createPullRequest:
-    if: |
-      github.event_name == 'issue_comment' &&
-      (github.event.comment.author_association == 'MEMBER' || github.event.comment.author_association == 'OWNER') &&
-      startsWith(github.event.comment.body, '/create release')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-      - name: Setup Node.js
-        uses: actions/setup-node@v1
-        with:
-          node_version: 12
-          registry-url: 'https://npm.pkg.github.com'
-      - name: Install
-        run: yarn install
-      - name: Run test
-        run: yarn run test
-      - name: Versionup commit
-        run: |
-          yarn run versionup --yes
-      - name: Set current CHANGELOG to output
-        id: changelog
-        shell: bash
-        run: |
-          version=$(node -p 'require("./lerna.json").version')
-          echo "::set-output name=version::${version}"
-      - name: Create Pull Requestw
-        id: cpr
-        uses: peter-evans/create-pull-request@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "Update v${{ steps.changelog.outputs.version }}"
-          committer: GitHub <noreply@github.com>
-          author: "${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>"
-          title: 'v${{ steps.changelog.outputs.version }}'
-          body: |
-            ## v${{ steps.changelog.outputs.version }}
-            ### Breaking Changes
-            - [ ] TODO
-            ### Features
-            - [ ] TODO
-            ### Bug Fixes
-            - [ ] TODO
-          labels: "Type: Release"
-          branch: "release/next"
-          request-to-parent: false
-      - name: Check outputs
-        run: |
-          echo "Pull Request Number - ${{ env.PULL_REQUEST_NUMBER }}"
-          echo "Pull Request Number - ${{ steps.cpr.outputs.pr_number }}"
+  jobs:
+    # Build the id-fe docker images
+    setup:
+      name: Setup Self-Hosted Runner
+      # Run below steps on a github, ubuntu worker node
+      runs-on: ubuntu-latest
+      outputs:
+        setup_job_output: ${{ steps.launch_runner.outputs.launched_task_arn }}
+      steps:
+        - name: Configure AWS Credentials
+          uses: aws-actions/configure-aws-credentials@v1
+          with:
+            aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            aws-region: us-east-1
+
+        # This step will launch an internal/self-hosted runner(container) but will not wait for it to launch, it will likely be ready by the
+        # time we get down to the job that uses it.
+        # Jobs that require access to internal smartbear services will use 'runs-on: self-hosted' to run on this runner.
+        # NOTE1: You will set your subnet(probably ok to use the below subnet) and your repo name, in this example we are using the 'smartbear-id' repo.
+        - name: Launch self-hosted runner
+          run: |
+            aws ecs run-task --network-configuration "awsvpcConfiguration={subnets=[subnet-18000c33],securityGroups=[],assignPublicIp='ENABLED'}" \
+            --overrides "{\"containerOverrides\":[{\"name\":\"devops-github-runner\",\"environment\":[{\"name\":\"GH_REPO\",\"value\":\"smartbear-id\"}]}]}"  \
+            --task-definition github-actions-runner-task \
+            --cluster github-actions-runners \
+            --launch-type FARGATE \
+            --started-by devops-team | jq .tasks[0].taskArn --raw-output > /tmp/launched_task_arn
+            echo "::set-output name=launched_task_arn::$(cat /tmp/launched_task_arn| sed 's/\// /g' | awk '{print $2}')"
+          id: launch_runner
+
+    build:
+      name: Build Images FE DEV
+      # Run below steps on a github, ubuntu worker node
+      runs-on: ubuntu-latest
+      steps:
+        # Clone the smartbear-id repo to the github worker node
+        - name: Clone smartbear-id repo
+          uses: actions/checkout@v2
+          with:
+            fetch-depth: 0
+            token: ${{ secrets.SWAG_BOT_TOKEN }}
+
+        # Create outputs from build context for subsequent steps.
+        - name: Extract context
+          run: |
+            version_nodejs=$(jq --raw-output .versions.nodejs .github/versions.json)
+            echo "::set-output name=VERSION_NODEJS::${version_nodejs}"
+          id: env_vars
+
+        # Install nodejs
+        - name: Install nodejs
+          run: sudo apt-get install nodejs -y
+
+        # Install specific nodejs version via nvm.
+        - name: Use nodejs ${{ steps.env_vars.outputs.VERSION_NODEJS }}
+          run: |
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+            [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+            nvm install ${{ steps.env_vars.outputs.VERSION_NODEJS }}
+            nvm use ${{ steps.env_vars.outputs.VERSION_NODEJS }}
+
+        # Install yarn to build the images
+        - name: Install yarn
+          run: |
+            sudo npm install -g yarn
+
+        # Install yarn dependencies.
+        # Rewrite git url and overwrite the GITHUB_TOKEN & GITHUB_USER secret env vars github-actions automatically adds.
+        #     "GitHub automatically creates a GITHUB_TOKEN secret to use in your workflow."
+        - name: yarn install dependencies
+          run: |
+            export GITHUB_TOKEN=${{ secrets.SWAG_BOT_TOKEN }}
+            export GITHUB_USER=${{ secrets.SWAG_BOT_USER }}
+            git config --global url."https://${{ secrets.SWAG_BOT_TOKEN }}@github.com/SmartBear/".insteadOf "ssh://git@github.com/SmartBear/"
+            sudo yarn install
+
+        # yarn build
+        - name: yarn build
+          run: |
+            sudo yarn build
+
+        # yarn test & show coverage reports
+        - name: yarn test
+          uses: dkershner6/jest-coverage-commenter-action@v1
+          with:
+            github_token: ${{ secrets.SWAG_BOT_TOKEN }}
+            test_command: "yarn test"
+
+        #       # yarn build app-login
+        #       - name: yarn build - app-login
+        #         # as login-app doesn't have corresponding package in the repo yet, temporarily using SDK
+        #         run: sudo yarn build:sdk-login-api
+        #         env:
+        #           # Set to empty to prevent: "Treating warnings as errors because process.env.CI = true."
+        #           CI: ""
+
+        # Build & push docker images to dockerhub.
+        # This step uses the Docker team/company created github action: build-push-action
+        #     https://github.com/marketplace/actions/build-and-push-docker-images
+
+
+
+
+
+    #       # commented out until login-app is ready to use (currently inactive in Rancher)
+    #       # SmartBear-ID Login App
+    #       - name: Build & push docker images - smartbear-id-login-app
+    #         uses: docker/build-push-action@v1
+    #         with:
+    #           build_args: GITHUB_TOKEN=${{ secrets.SWAG_BOT_TOKEN }}
+    #           username: ${{ secrets.DOCKER_USERNAME }}
+    #           password: ${{ secrets.DOCKER_PASSWORD }}
+    #           repository: smartbear/smartbear-id-login-app
+    #           tags: latest
+    #           # as login-app doesn't have corresponding package in the repo yet, temporarily using SDK
+    #           path: packages/sdk-login-api
+    #           # path: .
+    #           # dockerfile: packages/app-login/Dockerfile
+
+
+
+
+    terminate-runner:
+      # This job will terminate the internal/self-hosted runner(container).
+      # We want this if above jobs are successful or failed so we do not leave orphaned slaves lying around.
+      name: Stop self-hosted runner
+      if: ${{ failure() }} || ${{ success() }}
+      needs: [setup, nexus-publish]
+      runs-on: ubuntu-latest
+      steps:
+        - name: Configure AWS Credentials
+          uses: aws-actions/configure-aws-credentials@v1
+          with:
+            aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            aws-region: us-east-1
+
+        - name: Stop self-hosted runner
+          run: |
+            aws ecs stop-task --cluster github-actions-runners --task ${{needs.setup.outputs.setup_job_output}}
