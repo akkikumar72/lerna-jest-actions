@@ -2,9 +2,8 @@ name: Create Pull Request
 on:
   push:
     branches:
-      - master
-  issue_comment:
-    types: [created]
+      - fixes
+
 
 # require public member
 # private member is treated as CONTRIBUTOR
@@ -25,12 +24,8 @@ jobs:
           registry-url: 'https://npm.pkg.github.com'
       - name: Install
         run: yarn install
-      - name: Git Identity
-        run: |
-          git config --global user.name 'azu'
-          git config --global user.email 'azu@users.noreply.github.com'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run test
+        run: yarn run test
       - name: Versionup commit
         run: |
           yarn run versionup --yes
