@@ -40,7 +40,7 @@ jobs:
         run: |
           version=$(node -p 'require("./lerna.json").version')
           echo "::set-output name=version::${version}"
-      - name: Create Pull Request
+      - name: Create Pull Requestw
         id: cpr
         uses: peter-evans/create-pull-request@v2
         with:
