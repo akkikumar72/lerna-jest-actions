@@ -22,7 +22,7 @@ jobs:
       - name: Run test
         run: npm run test
       - name: show report
-        uses: ziishaned/jest-reporter-action@v0.0.1
+        uses: mattallty/jest-github-action@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          test-command: "npm run test --coverage"
+          test-command: "npm run test"
